@@ -5,37 +5,43 @@ import "./App.css";
 const CITIES = [
   "Lymhurst",
   "Bridgewatch",
-  "FortSterling",
+  "Fort Sterling",
   "Martlock",
   "Thetford",
   "Caerleon",
-  "BlackMarket"
+  "Black Market"
 ];
 
-const BASE_URL = "https://europe.albion-online-data.com/api/v2";
+const BASE_URL = "[europe.albion-online-data.com](https://europe.albion-online-data.com/api/v2)";
 
 const fetchPrices = async (items, locations) => {
-  const url = `${BASE_URL}/stats/prices/${items}?locations=${locations}`;
+  const url = `${BASE_URL}/stats/prices/${items}?locations=${locations}&qualities=1,2,3,4,5`;
   const res = await fetch(url);
   if (!res.ok) throw new Error("API error");
   return await res.json();
 };
 
-const fetchVolume = async (itemId, location, quality) => {
-  const today = new Date();
-  const dateStr = today.toISOString().split("T")[0];
+const fetchHistory = async (itemId, location) => {
   const baseId = itemId.includes("@") ? itemId.split("@")[0] : itemId;
-  const url = `${BASE_URL}/stats/charts/${baseId}?locations=${location}&date=${dateStr}&time-scale=24`;
+  const url = `${BASE_URL}/stats/history/${baseId}?locations=${location}&time-scale=24`;
   try {
     const res = await fetch(url);
-    if (!res.ok) return null;
+    if (!res.ok) return {};
     const data = await res.json();
-    const entry = data.find(x => Number(x.quality) === quality);
-    if (!entry || !entry.data.item_count.length) return null;
-    const counts = entry.data.item_count;
-    return counts[counts.length - 1];
+    
+    // Quality bazında günlük satış miktarlarını topla
+    const volumeByQuality = {};
+    data.forEach(entry => {
+      const q = Number(entry.quality);
+      if (entry.data && entry.data.length > 0) {
+        // Son 24 saatteki toplam satış
+        const totalCount = entry.data.reduce((sum, d) => sum + (d.item_count || 0), 0);
+        volumeByQuality[q] = totalCount;
+      }
+    });
+    return volumeByQuality;
   } catch {
-    return null;
+    return {};
   }
 };
 
@@ -63,7 +69,7 @@ const getItemName = (itemId) => {
 
 export default function App() {
   const [buyCity, setBuyCity] = useState("Lymhurst");
-  const [sellCity, setSellCity] = useState("BlackMarket");
+  const [sellCity, setSellCity] = useState("Black Market");
   const [buyType, setBuyType] = useState("sell_price_min");
   const [sellType, setSellType] = useState("buy_price_max");
   const [minProfit, setMinProfit] = useState(0);
@@ -110,7 +116,6 @@ export default function App() {
     let results = [];
     const totalBatches = Math.ceil(items.length / batchSize);
 
-    // 1. AŞAMA: Fiyatları tara
     for (let i = 0; i < items.length; i += batchSize) {
       const batch = items.slice(i, i + batchSize);
       const currentBatch = Math.floor(i / batchSize) + 1;
@@ -123,16 +128,21 @@ export default function App() {
           const itemData = json.filter((x) => x.item_id === item);
           const enchant = item.includes("@") ? Number(item.split("@")[1]) : 0;
 
+          // Tüm quality'leri kontrol et
           [1, 2, 3, 4, 5].forEach((q) => {
-            const buyData = itemData.find((x) => normalize(x.city) === normalize(buyCity) && Number(x.quality) === q);
-            const sellData = itemData.find((x) => normalize(x.city) === normalize(sellCity) && Number(x.quality) === q);
+            const buyData = itemData.find(
+              (x) => normalize(x.city) === normalize(buyCity) && Number(x.quality) === q
+            );
+            const sellData = itemData.find(
+              (x) => normalize(x.city) === normalize(sellCity) && Number(x.quality) === q
+            );
 
             if (!buyData || !sellData) return;
 
             const buyPrice = buyData[buyType];
             const sellPrice = sellData[sellType];
 
-            if (!buyPrice || !sellPrice) return;
+            if (!buyPrice || !sellPrice || buyPrice === 0 || sellPrice === 0) return;
 
             const profit = sellPrice - buyPrice;
             const profitPercent = (profit / buyPrice) * 100;
@@ -165,29 +175,28 @@ export default function App() {
       await new Promise(r => setTimeout(r, 100));
     }
 
-    // Fırsatları göster, volume arka planda yüklensin
     dataRef.current = results;
     setData([...results]);
-    setProgress(`${results.length} fırsat bulundu. Günlük hacimler yükleniyor...`);
+    setProgress(`${results.length} fırsat bulundu. Günlük satış miktarları yükleniyor...`);
 
-    // 2. AŞAMA: Bulunan fırsatlar için volume çek
-    const seen = new Set();
-    for (let i = 0; i < dataRef.current.length; i++) {
-      const row = dataRef.current[i];
-      const key = `${row.item}_${row.quality}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+    // Volume'ları çek - her item için bir kez
+    const itemsToFetch = [...new Set(results.map(r => r.item))];
+    
+    for (let i = 0; i < itemsToFetch.length; i++) {
+      const item = itemsToFetch[i];
+      setProgress(`Günlük satışlar: ${i + 1} / ${itemsToFetch.length}`);
+      
+      const volumeByQuality = await fetchHistory(item, sellCity);
 
-      const count = await fetchVolume(row.item, sellCity, row.quality);
-
-      dataRef.current = dataRef.current.map(r =>
-        r.item === row.item && r.quality === row.quality
-          ? { ...r, volume: count }
-          : r
-      );
+      dataRef.current = dataRef.current.map(r => {
+        if (r.item === item) {
+          return { ...r, volume: volumeByQuality[r.quality] ?? 0 };
+        }
+        return r;
+      });
       setData([...dataRef.current]);
 
-      await new Promise(r => setTimeout(r, 80));
+      await new Promise(r => setTimeout(r, 50));
     }
 
     setLoading(false);
@@ -264,7 +273,7 @@ export default function App() {
               Profit % <SortIcon col="profitPercent" />
             </th>
             <th onClick={() => handleSort("volume")} style={{ cursor: "pointer" }}>
-              Günlük Hacim <SortIcon col="volume" />
+              Günlük Satış <SortIcon col="volume" />
             </th>
           </tr>
         </thead>
@@ -275,7 +284,7 @@ export default function App() {
               <td>
                 <div>{row.name}</div>
                 <small style={{ color: "#64748b" }}>
-                  {QUALITY_NAMES[row.quality] || "Normal"} | +{row.enchant}
+                  {QUALITY_NAMES[row.quality]} | +{row.enchant}
                 </small>
               </td>
               <td>
@@ -300,8 +309,8 @@ export default function App() {
                 {row.volume === null
                   ? <span style={{ opacity: 0.4 }}>...</span>
                   : row.volume === 0
-                    ? <span style={{ color: "#f87171" }}>0</span>
-                    : <span style={{ color: row.volume > 500 ? "#4ade80" : row.volume > 100 ? "#facc15" : "#f87171" }}>
+                    ? <span style={{ color: "#94a3b8" }}>0</span>
+                    : <span style={{ color: row.volume > 50 ? "#4ade80" : row.volume > 10 ? "#facc15" : "#94a3b8" }}>
                         {row.volume.toLocaleString()}
                       </span>
                 }

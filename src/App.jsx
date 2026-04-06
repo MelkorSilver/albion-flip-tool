@@ -12,36 +12,45 @@ const CITIES = [
   "Black Market"
 ];
 
-const BASE_URL = "[europe.albion-online-data.com](https://europe.albion-online-data.com/api/v2)";
+const BASE_URL = "https://europe.albion-online-data.com/api/v2";
 
 const fetchPrices = async (items, locations) => {
-  const url = `${BASE_URL}/stats/prices/${items}?locations=${locations}&qualities=1,2,3,4,5`;
+  const url = `${BASE_URL}/stats/prices/${items}?locations=${locations}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error("API error");
   return await res.json();
 };
 
-const fetchHistory = async (itemId, location) => {
+const fetchWeeklyAverageVolume = async (itemId, location, quality) => {
+  const today = new Date();
+  const endDate = today.toISOString().split("T")[0];
+
+  const pastDate = new Date();
+  pastDate.setDate(pastDate.getDate() - 7);
+  const startDate = pastDate.toISOString().split("T")[0];
+
   const baseId = itemId.includes("@") ? itemId.split("@")[0] : itemId;
-  const url = `${BASE_URL}/stats/history/${baseId}?locations=${location}&time-scale=24`;
+
+  const url = `${BASE_URL}/stats/history/${baseId}?locations=${location}&date=${endDate}&end_date=${startDate}&time-scale=24`;
+
   try {
     const res = await fetch(url);
-    if (!res.ok) return {};
+    if (!res.ok) return null;
+
     const data = await res.json();
-    
-    // Quality bazında günlük satış miktarlarını topla
-    const volumeByQuality = {};
-    data.forEach(entry => {
-      const q = Number(entry.quality);
-      if (entry.data && entry.data.length > 0) {
-        // Son 24 saatteki toplam satış
-        const totalCount = entry.data.reduce((sum, d) => sum + (d.item_count || 0), 0);
-        volumeByQuality[q] = totalCount;
-      }
-    });
-    return volumeByQuality;
-  } catch {
-    return {};
+
+    const entry = data.find(x => Number(x.quality) === Number(quality));
+    if (!entry || !entry.data || !entry.data.length) return null;
+
+    const total = entry.data.reduce((sum, d) => sum + (d.item_count || 0), 0);
+
+    const avgDaily = total / 7;
+
+    return Math.floor(avgDaily);
+
+  } catch (err) {
+    console.error(err);
+    return null;
   }
 };
 
@@ -69,7 +78,7 @@ const getItemName = (itemId) => {
 
 export default function App() {
   const [buyCity, setBuyCity] = useState("Lymhurst");
-  const [sellCity, setSellCity] = useState("Black Market");
+  const [sellCity, setSellCity] = useState("BlackMarket");
   const [buyType, setBuyType] = useState("sell_price_min");
   const [sellType, setSellType] = useState("buy_price_max");
   const [minProfit, setMinProfit] = useState(0);
@@ -104,6 +113,13 @@ export default function App() {
     return <span> {sortDir === "desc" ? "↓" : "↑"}</span>;
   };
 
+  // ✅ volume renk sistemi
+  const getVolumeColor = (v) => {
+    if (v > 200) return "#4ade80";   // high
+    if (v > 50) return "#facc15";    // medium
+    return "#f87171";                // low
+  };
+
   const runScan = async () => {
     setLoading(true);
     setData([]);
@@ -116,6 +132,7 @@ export default function App() {
     let results = [];
     const totalBatches = Math.ceil(items.length / batchSize);
 
+    // 1. Fiyat tarama
     for (let i = 0; i < items.length; i += batchSize) {
       const batch = items.slice(i, i + batchSize);
       const currentBatch = Math.floor(i / batchSize) + 1;
@@ -128,21 +145,16 @@ export default function App() {
           const itemData = json.filter((x) => x.item_id === item);
           const enchant = item.includes("@") ? Number(item.split("@")[1]) : 0;
 
-          // Tüm quality'leri kontrol et
           [1, 2, 3, 4, 5].forEach((q) => {
-            const buyData = itemData.find(
-              (x) => normalize(x.city) === normalize(buyCity) && Number(x.quality) === q
-            );
-            const sellData = itemData.find(
-              (x) => normalize(x.city) === normalize(sellCity) && Number(x.quality) === q
-            );
+            const buyData = itemData.find((x) => normalize(x.city) === normalize(buyCity) && Number(x.quality) === q);
+            const sellData = itemData.find((x) => normalize(x.city) === normalize(sellCity) && Number(x.quality) === q);
 
             if (!buyData || !sellData) return;
 
             const buyPrice = buyData[buyType];
             const sellPrice = sellData[sellType];
 
-            if (!buyPrice || !sellPrice || buyPrice === 0 || sellPrice === 0) return;
+            if (!buyPrice || !sellPrice) return;
 
             const profit = sellPrice - buyPrice;
             const profitPercent = (profit / buyPrice) * 100;
@@ -152,6 +164,7 @@ export default function App() {
             const buyDate = buyType === "sell_price_min"
               ? buyData.sell_price_min_date
               : buyData.buy_price_max_date;
+
             const sellDate = sellType === "buy_price_max"
               ? sellData.buy_price_max_date
               : sellData.sell_price_min_date;
@@ -159,8 +172,12 @@ export default function App() {
             results.push({
               item,
               name: getItemName(item),
-              buyPrice, sellPrice, profit, profitPercent,
-              quality: q, enchant,
+              buyPrice,
+              sellPrice,
+              profit,
+              profitPercent,
+              quality: q,
+              enchant,
               buyAge: hoursAgo(buyDate),
               sellAge: hoursAgo(sellDate),
               volume: null,
@@ -177,26 +194,27 @@ export default function App() {
 
     dataRef.current = results;
     setData([...results]);
-    setProgress(`${results.length} fırsat bulundu. Günlük satış miktarları yükleniyor...`);
+    setProgress(`${results.length} fırsat bulundu. Günlük hacimler yükleniyor...`);
 
-    // Volume'ları çek - her item için bir kez
-    const itemsToFetch = [...new Set(results.map(r => r.item))];
-    
-    for (let i = 0; i < itemsToFetch.length; i++) {
-      const item = itemsToFetch[i];
-      setProgress(`Günlük satışlar: ${i + 1} / ${itemsToFetch.length}`);
-      
-      const volumeByQuality = await fetchHistory(item, sellCity);
+    // 2. Volume
+    const seen = new Set();
 
-      dataRef.current = dataRef.current.map(r => {
-        if (r.item === item) {
-          return { ...r, volume: volumeByQuality[r.quality] ?? 0 };
-        }
-        return r;
-      });
+    for (let i = 0; i < dataRef.current.length; i++) {
+      const row = dataRef.current[i];
+      const key = `${row.item}_${row.quality}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const count = await fetchWeeklyAverageVolume(row.item, sellCity, row.quality);
+
+      dataRef.current = dataRef.current.map(r =>
+        r.item === row.item && r.quality === row.quality
+          ? { ...r, volume: count }
+          : r
+      );
+
       setData([...dataRef.current]);
-
-      await new Promise(r => setTimeout(r, 50));
+      await new Promise(r => setTimeout(r, 80));
     }
 
     setLoading(false);
@@ -273,7 +291,7 @@ export default function App() {
               Profit % <SortIcon col="profitPercent" />
             </th>
             <th onClick={() => handleSort("volume")} style={{ cursor: "pointer" }}>
-              Günlük Satış <SortIcon col="volume" />
+              Günlük Hacim <SortIcon col="volume" />
             </th>
           </tr>
         </thead>
@@ -287,33 +305,37 @@ export default function App() {
                   {QUALITY_NAMES[row.quality]} | +{row.enchant}
                 </small>
               </td>
+
               <td>
                 {row.buyPrice.toLocaleString()}
                 <span style={{ color: "#64748b", fontSize: "11px", marginLeft: "4px" }}>
                   {row.buyAge}
                 </span>
               </td>
+
               <td>
                 {row.sellPrice.toLocaleString()}
                 <span style={{ color: "#64748b", fontSize: "11px", marginLeft: "4px" }}>
                   {row.sellAge}
                 </span>
               </td>
+
               <td style={{ color: row.profit > 0 ? "#4ade80" : "#f87171" }}>
                 {row.profit.toLocaleString()}
               </td>
+
               <td style={{ color: row.profit > 0 ? "#4ade80" : "#f87171" }}>
                 {row.profitPercent.toFixed(2)}%
               </td>
+
               <td>
-                {row.volume === null
-                  ? <span style={{ opacity: 0.4 }}>...</span>
-                  : row.volume === 0
-                    ? <span style={{ color: "#94a3b8" }}>0</span>
-                    : <span style={{ color: row.volume > 50 ? "#4ade80" : row.volume > 10 ? "#facc15" : "#94a3b8" }}>
-                        {row.volume.toLocaleString()}
-                      </span>
-                }
+                {row.volume === null ? (
+                  <span style={{ opacity: 0.4 }}>...</span>
+                ) : (
+                  <span style={{ color: getVolumeColor(row.volume) }}>
+                    {row.volume.toFixed(0)}/d
+                  </span>
+                )}
               </td>
             </tr>
           ))}

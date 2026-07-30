@@ -14,235 +14,43 @@ const TIER_COLORS = { 2: "#ffffff", 3: "#00c54a", 4: "#4a90d9", 5: "#b040e0", 6:
 
 const BASE_URL = "https://europe.albion-online-data.com/api/v2";
 
-const HISTORY_BATCH_SIZE = 40;
-const HISTORY_BATCH_DELAY = 150;
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function fetchWithRetry(url, retries = 3) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const controller = new AbortController();
-
-    const timeout = setTimeout(() => controller.abort(), 8000);
-
-    try {
-      const res = await fetch(url, {
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (res.ok) return res;
-
-      if (res.status === 429 || res.status >= 500) {
-        if (attempt === retries) return null;
-
-        const delay =
-          1000 * Math.pow(2, attempt) +
-          Math.random() * 500;
-
-        await sleep(delay);
-        continue;
-      }
-
-      return null;
-    } catch (err) {
-      clearTimeout(timeout);
-
-      if (attempt === retries) return null;
-
-      const delay =
-        1000 * Math.pow(2, attempt) +
-        Math.random() * 500;
-
-      await sleep(delay);
-    }
-  }
-
-  return null;
-}
-
-
-async function runQueue(tasks, concurrency = 8, onProgress = () => {}) {
-    const results = new Array(tasks.length);
-
-    let nextIndex = 0;
-    let completed = 0;
-
-    async function worker() {
-      while (true) {
-        const current = nextIndex++;
-
-        if (current >= tasks.length) return;
-
-        try {
-          results[current] = await tasks[current]();
-        } catch {
-          results[current] = null;
-        }
-
-        completed++;
-
-        if (completed % 10 === 0 || completed === tasks.length) onProgress(completed, tasks.length);
-      }
-    }
-
-    await Promise.all(
-      Array.from({ length: concurrency }, worker)
-    );
-
-    return results;
-  }
-
-
 const fetchPrices = async (items, locations) => {
   const url = `${BASE_URL}/stats/prices/${items}?locations=${locations}`;
-  const res = await fetchWithRetry(url);
-  if (!res) throw new Error("API error");
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("API error");
   return await res.json();
 };
 
-const getAverageDays = (period) => {
-    if (period === "24h") return 1;
-    if (period === "4w") return 28;
-    return 7;
-};
-
-const calculateMarketStats = (rows) => {
-
-    if (!rows?.length) {
-        return {
-            averagePrice: null,
-            averageVolume: null,
-        };
-    }
-
-    let totalPrice = 0;
-    let totalCount = 0;
-    let totalVolume = 0;
-
-    for (const row of rows) {
-
-        const count = Number(row.item_count || 0);
-        const price = Number(row.avg_price || 0);
-
-        totalPrice += price * count;
-        totalCount += count;
-        totalVolume += count;
-
-    }
-
-    return {
-
-        averagePrice:
-            totalCount
-                ? Math.round(totalPrice / totalCount)
-                : null,
-
-        averageVolume:
-            Math.floor(totalVolume / rows.length),
-
-    };
-
-};
-
-const fetchHistory = async (
-  itemId,
-  location,
-  quality,
-  period,
-  cache
-) => {
-  const baseId =
-    itemId.includes("@")
-      ? itemId.split("@")[0]
-      : itemId;
-
+const fetchWeeklyAverageVolume = async (itemId, location, quality) => {
   const today = new Date();
   const endDate = today.toISOString().split("T")[0];
 
-  const start = new Date();
-  start.setDate(start.getDate() - getAverageDays(period));
-  const startDate = start.toISOString().split("T")[0];
+  const pastDate = new Date();
+  pastDate.setDate(pastDate.getDate() - 7);
+  const startDate = pastDate.toISOString().split("T")[0];
 
-  const key = `${baseId}_${location}_${quality}_${startDate}_${endDate}`;
+  const baseId = itemId.includes("@") ? itemId.split("@")[0] : itemId;
 
-  const cached = cache.current.get(key);
-  if (cached && cached.expires > Date.now()) {
-    return cached.data;
-  } else if (cached) {
-    cache.current.delete(key);
-  }
-
-  const url =
-`${BASE_URL}/stats/history/${baseId}?locations=${location}&qualities=${quality}&date=${startDate}&end_date=${endDate}&time-scale=24`;
+  const url = `${BASE_URL}/stats/history/${baseId}?locations=${location}&date=${endDate}&end_date=${startDate}&time-scale=24`;
 
   try {
-    const res = await fetchWithRetry(url);
-    if (!res) return null;
+    const res = await fetch(url);
+    if (!res.ok) return null;
 
-    const json = await res.json();
+    const data = await res.json();
+    const entry = data.find(x => Number(x.quality) === Number(quality));
+    if (!entry || !entry.data || !entry.data.length) return null;
 
-    const entry = json.find(
-      x => Number(x.quality) === Number(quality)
-    );
+    const total = entry.data.reduce((sum, d) => sum + (d.item_count || 0), 0);
+    const avgDaily = total / 7;
 
-    if (!entry) return null;
+    return Math.floor(avgDaily);
 
-    cache.current.set(key, {
-      data: entry,
-      expires: Date.now() + 5 * 60 * 1000,
-    });
-
-    return entry;
-
-  } catch {
+  } catch (err) {
+    console.error(err);
     return null;
   }
 };
-
-
-const processHistoryBatches = async ({
-  uniqueRows,rowIndex,period,sellCity,historyCache,dataRef,setData,setProgress
-})=>{
-  for(let i=0;i<uniqueRows.length;i+=HISTORY_BATCH_SIZE){
-    const batch=uniqueRows.slice(i,i+HISTORY_BATCH_SIZE);
-
-    const tasks=batch.map(row=>async()=>{
-      const history=await fetchHistory(row.item,sellCity,row.quality,period,historyCache);
-      return {
-        row,
-        stats: history?.data?.length ? calculateMarketStats(history.data) : null
-      };
-    });
-
-    const results=(await runQueue(tasks,6)).filter(Boolean);
-
-    results.forEach(r=>{
-      const idx=rowIndex.get(`${r.row.item}_${r.row.quality}`);
-      if(idx===undefined) return;
-      const target=dataRef.current[idx];
-
-      target.averagePrice=r.stats?.averagePrice??null;
-      target.averageDiff=target.averagePrice!=null
-        ? ((target.buyPrice-target.averagePrice)/target.averagePrice)*100
-        : null;
-
-      target.volume=r.stats?.averageVolume??null;
-      target.dailyProfit=target.volume!=null
-        ? target.profit*target.volume
-        : null;
-    });
-
-    if(((i/HISTORY_BATCH_SIZE)%8)===7||i+HISTORY_BATCH_SIZE>=uniqueRows.length){
-      setData([...dataRef.current]);
-    }
-
-    setProgress(`Market Stats ${Math.min(i+batch.length,uniqueRows.length)} / ${uniqueRows.length}`);
-    await sleep(HISTORY_BATCH_DELAY);
-  }
-};
-
 
 const normalize = (c) => c.replace(/\s/g, "").toLowerCase();
 
@@ -335,12 +143,6 @@ const [minProfit, setMinProfit] = useState(() => {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(false);
   const [loadingVolume, setLoadingVolume] = useState(false);
-
-  const [averagePeriod, setAveragePeriod] = useState(() =>
-    localStorage.getItem("averagePeriod") || "7d"
-  );
-
-const historyCache = useRef(new Map());
   const [progress, setProgress] = useState("");
   const [sortKey, setSortKey] = useState(() =>
   localStorage.getItem("sortKey") || "profitPercent"
@@ -386,8 +188,6 @@ const historyCache = useRef(new Map());
   }
 });
   const [copiedItem, setCopiedItem] = useState(null);
-  const [itemsPerPage, setItemsPerPage] = useState(() => Number(localStorage.getItem("itemsPerPage") || 100));
-  const [currentPage, setCurrentPage] = useState(1);
   const boughtSet = useMemo(() => new Set(boughtItems.map(x=>x.key)), [boughtItems]);
   const dataRef = useRef([]);
 
@@ -444,11 +244,11 @@ const historyCache = useRef(new Map());
     });
   };
 
-  const copyItemName = async (itemName) => {
+  const copyItemId = async (itemId) => {
     try {
-      await navigator.clipboard.writeText(itemName);
+      await navigator.clipboard.writeText(itemId);
 
-      setCopiedItem(itemName);
+      setCopiedItem(itemId);
 
       setTimeout(() => {
         setCopiedItem(null);
@@ -462,15 +262,9 @@ const historyCache = useRef(new Map());
   const sortedData = useMemo(() => {
   return [...filteredData].sort((a, b) => {
     const mul = sortDir === "desc" ? -1 : 1;
-    if (
-      sortKey === "volume" ||
-      sortKey === "averagePrice" ||
-      sortKey === "averageDiff" ||
-      sortKey === "dailyProfit"
-    ) {
-      const av = a[sortKey] == null ? -1 : a[sortKey];
-      const bv = b[sortKey] == null ? -1 : b[sortKey];
-
+    if (sortKey === "volume") {
+      const av = a.volume === null ? -1 : a.volume;
+      const bv = b.volume === null ? -1 : b.volume;
       return mul * (av - bv);
     }
     return mul * (a[sortKey] - b[sortKey]);
@@ -478,41 +272,15 @@ const historyCache = useRef(new Map());
   });
 }, [filteredData, sortKey, sortDir]);
 
-  useEffect(() => { localStorage.setItem("itemsPerPage", itemsPerPage); }, [itemsPerPage]);
-  useEffect(() => { setCurrentPage(1); }, [searchText, qualityFilter, tierFilter, enchantFilter, sortKey, sortDir, itemsPerPage]);
-  useEffect(() => {
-    localStorage.setItem("averagePeriod", averagePeriod);
-  }, [averagePeriod]);
-
-  useEffect(()=>localStorage.setItem("buyCity",buyCity),[buyCity]);
-  useEffect(()=>localStorage.setItem("sellCity",sellCity),[sellCity]);
-  useEffect(()=>localStorage.setItem("buyType",buyType),[buyType]);
-  useEffect(()=>localStorage.setItem("sellType",sellType),[sellType]);
-  useEffect(()=>localStorage.setItem("minProfit",String(minProfit)),[minProfit]);
-  useEffect(()=>localStorage.setItem("sortKey",sortKey),[sortKey]);
-  useEffect(()=>localStorage.setItem("sortDir",sortDir),[sortDir]);
-  useEffect(()=>localStorage.setItem("searchText",searchText),[searchText]);
-  useEffect(()=>localStorage.setItem("qualityFilter",JSON.stringify(qualityFilter)),[qualityFilter]);
-  useEffect(()=>localStorage.setItem("tierFilter",JSON.stringify(tierFilter)),[tierFilter]);
-  useEffect(()=>localStorage.setItem("enchantFilter",JSON.stringify(enchantFilter)),[enchantFilter]);
-  useEffect(()=>localStorage.setItem("boughtItems",JSON.stringify(boughtItems)),[boughtItems]);
-
-  const totalPages = Math.max(1, Math.ceil(sortedData.length / itemsPerPage));
-  const pageStart = (currentPage - 1) * itemsPerPage;
-  const displayData = sortedData.slice(pageStart, pageStart + itemsPerPage);
-
   const SortIcon = ({ col }) => {
     if (sortKey !== col) return <span style={{ opacity: 0.3 }}> ↕</span>;
     return <span> {sortDir === "desc" ? "↓" : "↑"}</span>;
   };
 
   const getVolumeColor = (v) => {
-    if (v >= 500) return "#16a34a";
-    if (v >= 250) return "#22c55e";
-    if (v >= 100) return "#84cc16";
-    if (v >= 50) return "#eab308";
-    if (v >= 20) return "#f97316";
-    return "#ef4444";
+    if (v > 200) return "#4ade80";
+    if (v > 50) return "#facc15";
+    return "#f87171";
   };
 
   const runScan = async () => {
@@ -522,7 +290,7 @@ const historyCache = useRef(new Map());
     setProgress("Eşyalar yükleniyor...");
 
     const items = generateAllItems();
-    const batchSize = 300;
+    const batchSize = 100;
     const locations = `${buyCity},${sellCity}`;
     let results = [];
     const totalBatches = Math.ceil(items.length / batchSize);
@@ -534,30 +302,27 @@ const historyCache = useRef(new Map());
 
       try {
         const json = await fetchPrices(batch.join(","), locations);
-        const lookup = new Map();
-
-        for (const row of json) {
-          lookup.set(`${row.item_id}|${normalize(row.city)}|${row.quality}`, row);
-        }
 
         batch.forEach((item) => {
+          const itemData = json.filter((x) => x.item_id === item);
           const enchant = item.includes("@") ? Number(item.split("@")[1]) : 0;
 
-          for (let q = 1; q <= 5; q++) {
-            const buyData = lookup.get(`${item}|${normalize(buyCity)}|${q}`);
-            const sellData = lookup.get(`${item}|${normalize(sellCity)}|${q}`);
+          [1, 2, 3, 4, 5].forEach((q) => {
+            const buyData = itemData.find((x) => normalize(x.city) === normalize(buyCity) && Number(x.quality) === q);
+            const sellData = itemData.find((x) => normalize(x.city) === normalize(sellCity) && Number(x.quality) === q);
 
-            if (!buyData || !sellData) continue;
+            if (!buyData || !sellData) return;
 
             const buyPrice = buyData[buyType];
             const sellPrice = sellData[sellType];
+            const estimatedPrice = buyData.estimated_market_value || 0;
 
-            if (!buyPrice || !sellPrice) continue;
+            if (!buyPrice || !sellPrice) return;
 
             const profit = sellPrice - buyPrice;
             const profitPercent = (profit / buyPrice) * 100;
 
-            if (profitPercent < minProfit) continue;
+            if (profitPercent < minProfit) return;
 
             const buyDate = buyType === "sell_price_min"
               ? buyData.sell_price_min_date
@@ -572,6 +337,7 @@ const historyCache = useRef(new Map());
               name: getItemName(item),
               buyPrice,
               sellPrice,
+              estimatedPrice,
               profit,
               profitPercent,
               quality: q,
@@ -579,60 +345,56 @@ const historyCache = useRef(new Map());
               buyAge: hoursAgo(buyDate),
               sellAge: hoursAgo(sellDate),
               volume: null,
-              averagePrice: null,
-              averageDiff: null,
-              dailyProfit: null,
             });
-          }
+          });
         });
 
       } catch (err) {
         console.error(`Batch ${currentBatch} error:`, err);
       }
 
-      await sleep(25);
+      await new Promise(r => setTimeout(r, 100));
     }
 
     dataRef.current = results;
     setData([...results]);
-    setProgress(`✅ ${results.length} fırsat bulundu! Hacim için "Load Market Stats" butonuna tıklayın.`);
+    setProgress(`✅ ${results.length} fırsat bulundu! Hacim için "Load Daily Volume" butonuna tıklayın.`);
     setLoading(false);
   };
 
-  const runMarketStats = async () => {
+  const runVolume = async () => {
     if (dataRef.current.length === 0) {
       alert("Önce 'Run Scan' butonuna tıklayın!");
       return;
     }
+
     setLoadingVolume(true);
-    setProgress("Loading Market Stats...");
-    const seen=new Map();
-    for(const row of dataRef.current){
-      const key=`${row.item}_${row.quality}`;
-      if(!seen.has(key)) seen.set(key,row);
+    setProgress("Günlük hacimler yükleniyor...");
+
+    const seen = new Set();
+
+    for (let i = 0; i < dataRef.current.length; i++) {
+      const row = dataRef.current[i];
+      const key = `${row.item}_${row.quality}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const count = await fetchWeeklyAverageVolume(row.item, sellCity, row.quality);
+
+      dataRef.current = dataRef.current.map(r =>
+        r.item === row.item && r.quality === row.quality
+          ? { ...r, volume: count }
+          : r
+      );
+
+      setData([...dataRef.current]);
+      setProgress(`Hacim yükleniyor: ${i + 1} / ${dataRef.current.length}`);
+      await new Promise(r => setTimeout(r, 80));
     }
-    const uniqueRows=[...seen.values()];
-    const rowIndex=new Map();
-    dataRef.current.forEach((row,index)=>rowIndex.set(`${row.item}_${row.quality}`,index));
-    const progressFn=(msg)=>{
-      const m=msg.match(/(\d+)\s*\/\s*(\d+)/);
-      if(m) setProgress(`Loading Market Stats...\n\n${m[1]} of ${m[2]} items processed`);
-    };
-    await processHistoryBatches({
-      uniqueRows,
-      rowIndex,
-      period:averagePeriod,
-      sellCity,
-      historyCache,
-      dataRef,
-      setData,
-      setProgress:progressFn
-    });
+
     setLoadingVolume(false);
-    setProgress("✅ Market stats loaded!");
+    setProgress(`✅ Hacim verileri yüklendi!`);
   };
-
-
 
   return (
     <div style={{ display: "flex", height: "100vh", backgroundColor: "#0f172a" }}>
@@ -687,29 +449,15 @@ const historyCache = useRef(new Map());
             </button>
 
             <button
-              onClick={runMarketStats}
+              onClick={runVolume}
               disabled={loadingVolume || loading || data.length === 0}
-              style={{
-                marginLeft: "10px",
-                backgroundColor: loadingVolume ? "#666" : "#3b82f6"
-              }}
+              style={{ marginLeft: "10px", backgroundColor: loadingVolume ? "#666" : "#3b82f6" }}
             >
-              {loadingVolume ? "Loading Market Stats..." : "Load Market Stats"}
-            </button>
-
-            <select
-              value={averagePeriod}
-              onChange={(e) => setAveragePeriod(e.target.value)}
-              style={{ marginLeft: "10px" }}
-            >
-              <option value="24h">24h</option>
-              <option value="7d">7 Days</option>
-              <option value="4w">4 Weeks</option>
-            </select>
-
+              {loadingVolume ? "Hacim Yükleniyor..." : "Load Daily Volume"}
             
+</button>
 
-            <div style={{ marginBottom: "15px" }}>
+<div style={{ marginBottom: "15px" }}>
             <input
               type="text"
               placeholder="🔍 Search Item..."
@@ -797,38 +545,14 @@ const historyCache = useRef(new Map());
             <div style={{ marginBottom: "10px", color: "#94a3b8" }}>{progress}</div>
           )}
 
-          <div style={{display:"flex",justifyContent:"flex-end",alignItems:"center",gap:"12px",marginBottom:"10px",color:"#fff"}}>
-<span>Items/Page:</span>
-<select value={itemsPerPage} onChange={(e)=>setItemsPerPage(Number(e.target.value))} style={{padding:"6px",background:"#1e293b",color:"#fff",border:"1px solid #334155",borderRadius:"6px"}}>
-{[100,250,500,1000].map(n=><option key={n} value={n}>{n}</option>)}
-</select>
-<span>{sortedData.length===0?0:pageStart+1}-{Math.min(pageStart+itemsPerPage,sortedData.length)} / {sortedData.length}</span>
-<button onClick={()=>setCurrentPage(1)} disabled={currentPage===1}>⏮</button>
-<button onClick={()=>setCurrentPage(p=>Math.max(1,p-1))} disabled={currentPage===1}>◀</button>
-<span>{currentPage}/{totalPages}</span>
-<button onClick={()=>setCurrentPage(p=>Math.min(totalPages,p+1))} disabled={currentPage===totalPages}>▶</button>
-<button onClick={()=>setCurrentPage(totalPages)} disabled={currentPage===totalPages}>⏭</button>
-</div>
-
           {/* Table */}
           <div style={{ flex: 1, overflow: "auto" }}>
             <table style={{ width: "100%" }}>
               <thead style={{ position:"sticky", top:0, zIndex:100, background:"#0f172a" }}>
                 <tr>
                   <th>Item</th>
-                  <th onClick={() => handleSort("averagePrice")} style={{ cursor: "pointer" }}>
-                    Avg Price <SortIcon col="averagePrice" />
-                  </th>
-
-                  <th onClick={() => handleSort("volume")} style={{ cursor: "pointer" }}>
-                    Daily Volume <SortIcon col="volume" />
-                  </th>
-                  <th onClick={() => handleSort("dailyProfit")} style={{ cursor: "pointer" }}>
-                    Profit × Volume <SortIcon col="dailyProfit" />
-                  </th>
-
-                  <th onClick={() => handleSort("averageDiff")} style={{ cursor: "pointer" }}>
-                    Buy vs Avg % <SortIcon col="averageDiff" />
+                  <th onClick={() => handleSort("estimatedPrice")} style={{ cursor: "pointer" }}>
+                    Est. Price <SortIcon col="estimatedPrice" />
                   </th>
                   <th onClick={() => handleSort("buyPrice")} style={{ cursor: "pointer" }}>
                     Buy <SortIcon col="buyPrice" />
@@ -842,12 +566,15 @@ const historyCache = useRef(new Map());
                   <th onClick={() => handleSort("profitPercent")} style={{ cursor: "pointer" }}>
                     Profit % <SortIcon col="profitPercent" />
                   </th>
-                                    <th>Action</th>
+                  <th onClick={() => handleSort("volume")} style={{ cursor: "pointer" }}>
+                    Günlük Hacim <SortIcon col="volume" />
+                  </th>
+                  <th>Action</th>
                 </tr>
               </thead>
 
               <tbody>
-                {displayData.map((row, i) => {
+                {sortedData.map((row, i) => {
                   const isBought = boughtSet.has(getRowKey(row));
                   return (
                     <tr key={i}>
@@ -878,7 +605,7 @@ const historyCache = useRef(new Map());
                                 )}
 
                                 <span
-                                  onClick={() => copyItemName(row.name)}
+                                  onClick={() => copyItemId(row.item)}
                                   style={{
                                     cursor: "pointer",
                                     userSelect: "none",
@@ -886,7 +613,7 @@ const historyCache = useRef(new Map());
                                 >
                                   {row.name}
 
-                                  {copiedItem === row.name && (
+                                  {copiedItem === row.item && (
                                     <span
                                       style={{
                                         marginLeft: "8px",
@@ -909,50 +636,7 @@ const historyCache = useRef(new Map());
                       </td>
 
                       <td>
-                        {row.averagePrice == null ? (
-                          <span style={{ opacity: 0.4 }}>...</span>
-                        ) : (
-                          row.averagePrice.toLocaleString()
-                        )}
-                      </td>
-
-                      <td>
-                        {row.volume==null?<span style={{opacity:0.4}}>...</span>:<span style={{color:getVolumeColor(row.volume),fontWeight:"bold"}}>{row.volume.toFixed(0)}/d</span>}
-                      </td>
-                      <td>
-                        {row.dailyProfit==null?<span style={{opacity:0.4}}>...</span>:<span style={{
-color:row.dailyProfit>=100000000?"#16a34a":
-row.dailyProfit>=50000000?"#22c55e":
-row.dailyProfit>=20000000?"#84cc16":
-row.dailyProfit>=10000000?"#eab308":
-row.dailyProfit>=5000000?"#f97316":"#ef4444",
-fontWeight:"bold"}}>{row.dailyProfit.toLocaleString()}</span>}
-                      </td>
-
-                      <td
-                        style={{
-                          color:
-                            row.averageDiff == null
-                              ? "#94a3b8"
-                              : row.averageDiff <= -25
-                              ? "#22c55e"
-                              : row.averageDiff <= -15
-                              ? "#4ade80"
-                              : row.averageDiff <= -5
-                              ? "#facc15"
-                              : row.averageDiff <= 5
-                              ? "#fb923c"
-                              : row.averageDiff <= 15
-                              ? "#f87171"
-                              : "#ef4444",
-                          fontWeight: "bold",
-                        }}
-                      >
-                        {row.averageDiff == null ? (
-                          <span style={{ opacity: 0.4 }}>...</span>
-                        ) : (
-                          `${row.averageDiff.toFixed(1)}%`
-                        )}
+                        {row.estimatedPrice.toLocaleString()}
                       </td>
 
                       <td>
@@ -977,7 +661,16 @@ fontWeight:"bold"}}>{row.dailyProfit.toLocaleString()}</span>}
                         {row.profitPercent.toFixed(2)}%
                       </td>
 
-                      
+                      <td>
+                        {row.volume === null ? (
+                          <span style={{ opacity: 0.4 }}>...</span>
+                        ) : (
+                          <span style={{ color: getVolumeColor(row.volume) }}>
+                            {row.volume.toFixed(0)}/d
+                          </span>
+                        )}
+                      </td>
+
                       <td>
                         <button
                           onClick={() => toggleBought(row)}
